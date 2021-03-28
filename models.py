@@ -69,20 +69,22 @@ class NearestNeighborSemanticParser(object):
 
 class Seq2SeqSemanticParser(nn.Module):
     def __init__(self, input_indexer, output_indexer,
-                 in_emb_dim, out_emb_dim, hidden_size,
-                 embedding_dropout=0.2, bidirect=True):
+                 in_emb_dim, hidden_size,
+                 embedding_dropout=0.2, tf_ratio=0.5,
+                 bidirect=True):
 
         # We've include some args for setting up the input embedding and encoder
         # You'll need to add code for output embedding and decoder
         super(Seq2SeqSemanticParser, self).__init__()
+        self.tf_ratio = tf_ratio
         self.input_indexer = input_indexer
         self.output_indexer = output_indexer
-        
+
         self.input_emb = EmbeddingLayer(in_emb_dim, len(input_indexer), embedding_dropout)
         self.encoder = RNNEncoder(in_emb_dim, hidden_size, bidirect)
 
-        self.output_emb = EmbeddingLayer(out_emb_dim, len(output_indexer), embedding_dropout)
-        self.decoder = RNNDecoder(out_emb_dim, hidden_size, bidirect)
+        self.output_emb = EmbeddingLayer(hidden_size, len(output_indexer), embedding_dropout)
+        self.decoder = RNNDecoder(hidden_size, len(output_indexer))
     
     def forward(self, x_tensor, inp_lens_tensor, y_tensor, out_lens_tensor):
         """
@@ -126,53 +128,63 @@ class Seq2SeqSemanticParser(nn.Module):
         enc_final_states = 3 x dim
         """
 
-        batch_sz = x_tensor.shape[0]
+        # batch_sz = x_tensor.shape[0]
 
         # append EOS token to input
-        eos_tensor = torch.tensor([self.input_indexer.index_of(EOS_SYMBOL)] * batch_sz)
-        x_tensor = torch.cat((x_tensor, eos_tensor), 1)
+        # eos_tensor = torch.tensor([self.input_indexer.index_of(EOS_SYMBOL)] * batch_sz).reshape(batch_sz, 1)
+        # x_tensor = torch.cat((x_tensor, eos_tensor), 1)
 
         input_emb = self.input_emb.forward(x_tensor)
         (enc_output_each_word, enc_context_mask, enc_final_states) = self.encoder.forward(input_emb, inp_lens_tensor)
         enc_final_states_reshaped = (enc_final_states[0].unsqueeze(0), enc_final_states[1].unsqueeze(0))
         return (enc_output_each_word, enc_context_mask, enc_final_states_reshaped)
 
-    def _decode_output(self, y_tensor:torch.Tensor,
-                       out_lens_tensor:torch.Tensor,
+    def _decode_output(self, y_tensor:torch.Tensor, out_lens_tensor:torch.Tensor,
                        init_h:torch.Tensor) -> (torch.Tensor, torch.Tensor):
         """
         passes target through decoder one time step at a time using teacher forcing
         :arg y_tensor: tensor with target indices for decoder
         :arg out_lens_tensor: length of each target sentence
-        :arg init_h: initial hidden state of decoder (context vector for enocoder)
+        :arg init_h: initial hidden state of decoder (context vector for encoder)
         :returns: average loss across inputs and total loss across timesteps
         """
 
         # initial hidden state is context vector of encoder
         dec_hidden = init_h
 
-        # cumulative loss across time steps
         loss = 0.0
-
         batch_sz = y_tensor.shape[0]
-        seq_len = y_tensor.shape[1]
+        target_len = y_tensor.shape[1]
+        EOS = self.output_indexer.index_of(EOS_SYMBOL)
 
         # SOS token, initial input
-        y_step = torch.tensor([[self.output_indexer.index_of(SOS_SYMBOL)] * batch_sz])
+        y_step = torch.tensor([[self.output_indexer.index_of(SOS_SYMBOL)] * batch_sz]).reshape(batch_sz, -1)
+
+        teacher_forcing = True if random.random() < self.tf_ratio else False
 
         # teacher forcing, pass gold target as input for current timestep
-        for t in range(1, seq_len):
+        for t in range(target_len):
 
-            out_emb = self.output_emb.forward(y_step)
+            out_emb = self.output_emb(y_step)
 
-            probs, dec_hidden = self.decoder.forward(out_emb, out_lens_tensor, dec_hidden)
+            probs, dec_hidden = self.decoder(out_emb, dec_hidden)
 
             # compute loss
-            loss += F.nll_loss(probs, y_tensor[:, t])
+            target = y_tensor[:, t]
+            loss += F.nll_loss(probs, target)
 
-            # pass next word
-            y_step = y_tensor[:, t]
+            if teacher_forcing:
+                # pass target as input
+                y_step = target.reshape(batch_sz, 1)
 
+            else:
+                # pass prediction as next input
+                y_step = torch.argmax(probs, dim=1).detach().reshape(batch_sz, -1)
+
+        # compute mean loss across timesteps
+        loss = loss / target_len
+
+        # compute mean loss across the batch
         avg_loss = loss / batch_sz
 
         return avg_loss, loss
@@ -289,30 +301,44 @@ class RNNEncoder(nn.Module):
 
 class RNNDecoder(nn.Module):
 
-    def __init__(self, hidden_sz:int, output_sz:int, bidirect:bool, **kwargs):
-        super(RNNDecoder, self).__init__(**kwargs)
+    def __init__(self, hidden_sz:int, output_sz:int):
+        super(RNNDecoder, self).__init__()
 
         self.hidden_sz = hidden_sz
         self.output_sz = output_sz
-        self.rnn = nn.LSTM(hidden_sz, hidden_sz, bidirectional=bidirect)
+        self.rnn = nn.LSTM(hidden_sz, hidden_sz, batch_first=True)
         self.out = nn.Linear(hidden_sz, output_sz)
         self.softmax = nn.LogSoftmax(dim=1)
+        self.init_weight()
 
-    def forward(self, input, input_lens, init_h):
+    def init_weight(self):
+        """
+        Initializes weight matrices using Xavier initialization
+        :return:
+        """
+
+        nn.init.xavier_uniform_(self.out.weight)
+        nn.init.xavier_uniform_(self.rnn.weight_hh_l0, gain=1)
+        nn.init.xavier_uniform_(self.rnn.weight_ih_l0, gain=1)
+
+        nn.init.constant_(self.rnn.bias_hh_l0, 0)
+        nn.init.constant_(self.rnn.bias_ih_l0, 0)
+
+
+    def forward(self, input, hidden):
         """
         :arg input: embeddings for target language
         :arg input_lens: length of each sentence in input
-        :arg init_h: initial hidden state of Decoder (final hidden state of encoder)
+        :arg hidden: initial hidden state of Decoder (final hidden state of encoder)
         :arg enc_mask: used to accumulate valid loss terms
         :returns: probability distribution over words
         """
-        packed_embedding = nn.utils.rnn.pack_padded_sequence(input, input_lens, batch_first=True, enforce_sorted=False)
-        packed_output, (h, c) = self.rnn(packed_embedding, init_h)
-        output = nn.utils.rnn.pad_packed_sequence(packed_output, batch_first=True)
-
-        x = self.out(output[0])
+        input = F.relu(input)
+        output, (h, c) = self.rnn(input, hidden)
+        x = self.out(output).reshape(-1, self.output_sz)
         probs = self.softmax(x)
-        return probs
+        s = probs.sum(dim=1)
+        return probs, (h, c)
 
 
 
@@ -380,7 +406,7 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
     hidden_sz = 20
 
     # instantiate model
-    seq2seq = Seq2SeqSemanticParser(input_indexer, output_indexer, input_max_len, output_max_len, hidden_sz)
+    seq2seq = Seq2SeqSemanticParser(input_indexer, output_indexer, input_max_len, hidden_sz)
 
     encoder_optim = torch.optim.SGD(seq2seq.encoder.parameters(), lr=lr)
     decoder_optim = torch.optim.SGD(seq2seq.decoder.parameters(), lr=lr)
@@ -403,7 +429,7 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
         avg_loss = 0.0
         n_batches = all_train_input_data.shape[0] // batch_sz
 
-        # train model on batches
+        # train model on batch of input
         for start in range(0, idxs.size, batch_sz):
             end = start + batch_sz
             batch_idxs = idxs[start:end]
@@ -423,6 +449,9 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
 
             loss.backward()
 
+            encoder_optim.step()
+            decoder_optim.step()
+
         avg_loss /= n_batches
 
         return avg_loss
@@ -438,9 +467,9 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
 
     for e in range(epochs):
 
-        enc_loss, dec_loss = _train(seq2seq, all_train_input_data, all_train_output_data, batch_sz)
-        metrics = _test(seq2seq, all_test_input_data, all_test_output_data)
+        avg_loss = _train(seq2seq, all_train_input_data, all_train_output_data, batch_sz)
+        # metrics = _test(seq2seq, all_test_input_data, all_test_output_data)
 
-        print(f"===> Epoch: {e}, Encoder Loss: {enc_loss}, Decoder Loss: {dec_loss}")
+        print(f"===> Epoch: {e}, Avg. Loss: {avg_loss}")
 
     return seq2seq
