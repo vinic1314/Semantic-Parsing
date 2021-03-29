@@ -86,7 +86,7 @@ class Seq2SeqSemanticParser(nn.Module):
         self.output_emb = EmbeddingLayer(hidden_size, len(output_indexer), embedding_dropout)
         self.decoder = RNNDecoder(hidden_size, len(output_indexer))
     
-    def forward(self, x_tensor, inp_lens_tensor, y_tensor, out_lens_tensor):
+    def forward(self, x_tensor, inp_lens_tensor, y_tensor):
         """
         :param x_tensor/y_tensor: either a non-batched input/output [sent len x voc size] or a batched input/output
         [batch size x sent len x voc size]
