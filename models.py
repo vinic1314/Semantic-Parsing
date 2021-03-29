@@ -69,9 +69,8 @@ class NearestNeighborSemanticParser(object):
 
 class Seq2SeqSemanticParser(nn.Module):
     def __init__(self, input_indexer, output_indexer,
-                 in_emb_dim, hidden_size,
-                 embedding_dropout=0.2, tf_ratio=0.5,
-                 bidirect=True):
+                 in_emb_dim, hidden_size, out_max_len,
+                 embedding_dropout=0.2, tf_ratio=0.5, bidirect=True):
 
         # We've include some args for setting up the input embedding and encoder
         # You'll need to add code for output embedding and decoder
@@ -79,6 +78,7 @@ class Seq2SeqSemanticParser(nn.Module):
         self.tf_ratio = tf_ratio
         self.input_indexer = input_indexer
         self.output_indexer = output_indexer
+        self.out_max_len = out_max_len
 
         self.input_emb = EmbeddingLayer(in_emb_dim, len(input_indexer), embedding_dropout)
         self.encoder = RNNEncoder(in_emb_dim, hidden_size, bidirect)
@@ -96,14 +96,59 @@ class Seq2SeqSemanticParser(nn.Module):
         """
 
         enc_word, enc_mask, enc_h = self._encode_input(x_tensor, inp_lens_tensor)
-        avg_loss, loss = self._decode_output(y_tensor, out_lens_tensor, enc_h)
+        init_h = enc_h
+
+        avg_loss, loss = self._decode_output(y_tensor, init_h)
 
         return avg_loss, loss
 
 
     def decode(self, test_data: List[Example]) -> List[List[Derivation]]:
 
-        raise Exception("implement me!")
+
+        EOS = self.output_indexer.index_of(EOS_SYMBOL)
+
+        input_max_len = np.max(np.asarray([len(ex.x_indexed) for ex in test_data]))
+        all_input_test_data = make_padded_input_tensor(test_data, self.input_indexer, input_max_len, reverse_input=False)
+
+        derivations = list()
+
+        # get derivation for each example
+        for i in range(all_input_test_data.shape[0]):
+
+            deriv = list()
+            x_tensor = torch.tensor(all_input_test_data[i]).reshape(1, -1)
+            x_lens = torch.tensor(np.count_nonzero(x_tensor, axis=1))
+
+            # encode each example
+            enc_word, enc_mask, enc_h = self._encode_input(x_tensor, x_lens)
+
+            dec_h = enc_h
+            y_step = torch.tensor([self.output_indexer.index_of(SOS_SYMBOL)]).reshape(1, -1)
+
+            for t in range(self.out_max_len):
+
+                # embed target token
+                out_emb = self.output_emb(y_step)
+
+                # call decoder and get most likely token at each step
+                probs, dec_h = self.decoder(out_emb, dec_h)
+
+                # new input is predicted token
+                y_step_t = torch.argmax(probs, dim=1).detach()
+
+                if y_step_t.item() == EOS:
+                    break
+
+                y_tok = self.output_indexer.get_object(y_step_t.item())
+
+                deriv.append(y_tok)
+
+                y_step = y_step_t.reshape(1, -1)
+
+            derivations.append(deriv)
+
+        return derivations
 
 
     def _encode_input(self, x_tensor, inp_lens_tensor):
@@ -139,8 +184,7 @@ class Seq2SeqSemanticParser(nn.Module):
         enc_final_states_reshaped = (enc_final_states[0].unsqueeze(0), enc_final_states[1].unsqueeze(0))
         return (enc_output_each_word, enc_context_mask, enc_final_states_reshaped)
 
-    def _decode_output(self, y_tensor:torch.Tensor, out_lens_tensor:torch.Tensor,
-                       init_h:torch.Tensor) -> (torch.Tensor, torch.Tensor):
+    def _decode_output(self, y_tensor:torch.Tensor, init_h:tuple) -> (torch.Tensor, torch.Tensor):
         """
         passes target through decoder one time step at a time using teacher forcing
         :arg y_tensor: tensor with target indices for decoder
@@ -155,7 +199,6 @@ class Seq2SeqSemanticParser(nn.Module):
         loss = 0.0
         batch_sz = y_tensor.shape[0]
         target_len = y_tensor.shape[1]
-        EOS = self.output_indexer.index_of(EOS_SYMBOL)
 
         # SOS token, initial input
         y_step = torch.tensor([[self.output_indexer.index_of(SOS_SYMBOL)] * batch_sz]).reshape(batch_sz, -1)
@@ -406,7 +449,7 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
     hidden_sz = 20
 
     # instantiate model
-    seq2seq = Seq2SeqSemanticParser(input_indexer, output_indexer, input_max_len, hidden_sz)
+    seq2seq = Seq2SeqSemanticParser(input_indexer, output_indexer, input_max_len, hidden_sz, output_max_len)
 
     encoder_optim = torch.optim.SGD(seq2seq.encoder.parameters(), lr=lr)
     decoder_optim = torch.optim.SGD(seq2seq.decoder.parameters(), lr=lr)
