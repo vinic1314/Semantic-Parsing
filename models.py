@@ -454,8 +454,6 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
     # instantiate model
     seq2seq = Seq2SeqSemanticParser(input_indexer, output_indexer, input_max_len, hidden_sz, output_max_len)
 
-    encoder_optim = torch.optim.SGD(seq2seq.encoder.parameters(), lr=lr)
-    decoder_optim = torch.optim.SGD(seq2seq.decoder.parameters(), lr=lr)
     encoder_optim = torch.optim.Adam(seq2seq.encoder.parameters(), lr=lr)
     decoder_optim = torch.optim.Adam(seq2seq.decoder.parameters(), lr=lr)
 
@@ -486,7 +484,6 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
             y = torch.tensor(all_train_output_data[batch_idxs])
 
             x_lens = torch.tensor(np.count_nonzero(x, axis=1))
-            y_lens = torch.tensor(np.count_nonzero(y, axis=1))
 
             # zero out previous gradients
             encoder_optim.zero_grad()
