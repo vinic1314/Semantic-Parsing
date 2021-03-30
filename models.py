@@ -84,8 +84,10 @@ class Seq2SeqSemanticParser(nn.Module):
         self.encoder = RNNEncoder(in_emb_dim, hidden_size, bidirect)
 
         self.output_emb = EmbeddingLayer(hidden_size, len(output_indexer), embedding_dropout)
+        self.output_emb = EmbeddingLayer(hidden_size, len(output_indexer), 0.5)
         self.decoder = RNNDecoder(hidden_size, len(output_indexer))
-    
+
+
     def forward(self, x_tensor, inp_lens_tensor, y_tensor):
         """
         :param x_tensor/y_tensor: either a non-batched input/output [sent len x voc size] or a batched input/output
@@ -146,7 +148,8 @@ class Seq2SeqSemanticParser(nn.Module):
 
                 y_step = y_step_t.reshape(1, -1)
 
-            derivations.append(deriv)
+            deriv = Derivation(test_data[i], 1, deriv)
+            derivations.append([deriv])
 
         return derivations
 
@@ -453,6 +456,8 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
 
     encoder_optim = torch.optim.SGD(seq2seq.encoder.parameters(), lr=lr)
     decoder_optim = torch.optim.SGD(seq2seq.decoder.parameters(), lr=lr)
+    encoder_optim = torch.optim.Adam(seq2seq.encoder.parameters(), lr=lr)
+    decoder_optim = torch.optim.Adam(seq2seq.decoder.parameters(), lr=lr)
 
     def _train(seq2seq:Seq2SeqSemanticParser,
                all_train_input_data:np.ndarray,
@@ -487,7 +492,7 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
             encoder_optim.zero_grad()
             decoder_optim.zero_grad()
 
-            batch_loss, loss = seq2seq(x, x_lens, y, y_lens)
+            batch_loss, loss = seq2seq(x, x_lens, y)
             avg_loss += batch_loss
 
             loss.backward()
