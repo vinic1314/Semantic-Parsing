@@ -79,11 +79,11 @@ class Seq2SeqSemanticParser(nn.Module):
         self.input_indexer = input_indexer
         self.output_indexer = output_indexer
         self.out_max_len = out_max_len
+        self.pad_idx = self.output_indexer.index_of(PAD_SYMBOL)
 
         self.input_emb = EmbeddingLayer(in_emb_dim, len(input_indexer), embedding_dropout)
         self.encoder = RNNEncoder(in_emb_dim, hidden_size, bidirect)
 
-        self.output_emb = EmbeddingLayer(hidden_size, len(output_indexer), embedding_dropout)
         self.output_emb = EmbeddingLayer(hidden_size, len(output_indexer), 0.5)
         self.decoder = RNNDecoder(hidden_size, len(output_indexer))
 
@@ -208,6 +208,10 @@ class Seq2SeqSemanticParser(nn.Module):
 
         teacher_forcing = True if random.random() < self.tf_ratio else False
 
+        # update ratio
+        if teacher_forcing:
+            self.tf_ratio -= .05
+
         # teacher forcing, pass gold target as input for current timestep
         for t in range(target_len):
 
@@ -215,9 +219,8 @@ class Seq2SeqSemanticParser(nn.Module):
 
             probs, dec_hidden = self.decoder(out_emb, dec_hidden)
 
-            # compute loss
             target = y_tensor[:, t]
-            loss += F.nll_loss(probs, target)
+            loss += F.nll_loss(probs, target, ignore_index=self.pad_idx)
 
             if teacher_forcing:
                 # pass target as input
@@ -432,11 +435,11 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
     # Create indexed input
     input_max_len = np.max(np.asarray([len(ex.x_indexed) for ex in train_data]))
     all_train_input_data = make_padded_input_tensor(train_data, input_indexer, input_max_len, reverse_input=False)
-    all_test_input_data = make_padded_input_tensor(dev_data, input_indexer, input_max_len, reverse_input=False)
+    # all_test_input_data = make_padded_input_tensor(dev_data, input_indexer, input_max_len, reverse_input=False)
 
     output_max_len = np.max(np.asarray([len(ex.y_indexed) for ex in train_data]))
     all_train_output_data = make_padded_output_tensor(train_data, output_indexer, output_max_len)
-    all_test_output_data = make_padded_output_tensor(dev_data, output_indexer, output_max_len)
+    # all_test_output_data = make_padded_output_tensor(dev_data, output_indexer, output_max_len)
 
     if args.print_dataset:
         print("Train length: %i" % input_max_len)
@@ -449,7 +452,7 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
     lr = args.lr
     epochs = args.epochs
     batch_sz = args.batch_size
-    hidden_sz = 20
+    hidden_sz = 300
 
     # instantiate model
     seq2seq = Seq2SeqSemanticParser(input_indexer, output_indexer, input_max_len, hidden_sz, output_max_len)
