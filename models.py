@@ -20,6 +20,7 @@ def add_models_args(parser):
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--batch_size', type=int, default=2, help='batch size')
     parser.add_argument('--hidden_size', type=int, default=50, help='hidden size of LSTM')
+    parser.add_argument('--decoder', type=str, default='vanilla', help='Type of decoder to use (vanilla or attention)')
 
     # 65 is all you need for GeoQuery
     parser.add_argument('--decoder_len_limit', type=int, default=65, help='output length limit of the decoder')
@@ -70,7 +71,7 @@ class NearestNeighborSemanticParser(object):
 class Seq2SeqSemanticParser(nn.Module):
     def __init__(self, input_indexer, output_indexer,
                  in_emb_dim, hidden_size, out_max_len,
-                 embedding_dropout=0.2, tf_ratio=1.0, bidirect=True):
+                 embedding_dropout=0.2, tf_ratio=1.0, bidirect=True, decoder_type='vanilla'):
 
         # We've include some args for setting up the input embedding and encoder
         # You'll need to add code for output embedding and decoder
@@ -85,7 +86,11 @@ class Seq2SeqSemanticParser(nn.Module):
         self.encoder = RNNEncoder(in_emb_dim, hidden_size, bidirect)
 
         self.output_emb = EmbeddingLayer(hidden_size, len(output_indexer), embedding_dropout)
-        self.decoder = RNNDecoder(hidden_size, len(output_indexer))
+
+        if decoder_type == 'attention':
+            self.decoder = AttnDecoder(hidden_size, len(output_indexer))
+        else:
+            self.decoder = RNNDecoder(hidden_size, len(output_indexer))
 
 
     def forward(self, x_tensor, inp_lens_tensor, y_tensor):
@@ -232,6 +237,9 @@ class Seq2SeqSemanticParser(nn.Module):
         # compute mean loss across the batch
         avg_loss = loss / batch_sz
 
+        # TODO train on first 5 tokens of each sequence
+        # model not using encoder information correctly
+
         return avg_loss, loss
 
 
@@ -373,10 +381,9 @@ class RNNDecoder(nn.Module):
     def forward(self, input, hidden):
         """
         :arg input: embeddings for target language
-        :arg input_lens: length of each sentence in input
         :arg hidden: initial hidden state of Decoder (final hidden state of encoder)
         :arg enc_mask: used to accumulate valid loss terms
-        :returns: probability distribution over words
+        :returns: probability distribution over target words, current hidden state and cell state
         """
         input = F.relu(input)
         output, (h, c) = self.rnn(input, hidden)
@@ -384,6 +391,57 @@ class RNNDecoder(nn.Module):
         probs = self.softmax(x)
         s = probs.sum(dim=1)
         return probs, (h, c)
+
+
+class AttnDecoder(nn.Module):
+
+    def __init__(self, hidden_sz:int, output_sz:int, max_length:int):
+        super(AttnDecoder, self).__init__()
+        self.hidden_sz = hidden_sz
+        self.output_sz = output_sz
+        self.max_length = max_length
+        self.attn = nn.Linear(hidden_sz * 2, max_length)
+        self.attn_combine = nn.Linear(hidden_sz * 2, hidden_sz)
+        self.dropout = nn.Dropout(p=0.2)
+        self.rnn = nn.LSTM(hidden_sz, hidden_sz)
+        self.out = nn.Linear(hidden_sz, output_sz)
+
+        self.init_weight()
+
+    def init_weight(self):
+        """
+        Initializes weight matrices using Xavier initialization
+        """
+        nn.init.xavier_uniform_(self.attn.weight)
+        nn.init.xavier_uniform_(self.attn_combine.weight)
+        nn.init.xavier_uniform_(self.out.weight)
+        nn.init.xavier_uniform_(self.rnn.weight_hh_l0, gain=1)
+        nn.init.xavier_uniform_(self.rnn.weight_ih_l0, gain=1)
+
+        nn.init.constant_(self.rnn.bias_hh_l0, 0)
+        nn.init.constant_(self.rnn.bias_ih_l0, 0)
+
+    def forward(self, emb, hidden, enc_outputs):
+        """
+        :arg emb: embeddings for target language
+        :arg hidden: hidden state of encoder, initial state of decoder
+        :arg enc_outputs: outputs for each token in source language, used for attention
+        :returns: log probability distribution over target language,
+                  hidden state of current cell, and attention weights
+        """
+
+        attn_weights = F.softmax(self.attn(torch.cat((emb[0], hidden[0]), 1)), dim=1)
+        attn_applied = torch.bmm(attn_weights.unsqueeze(0), enc_outputs.unsqueeze(0))
+
+        output = torch.cat((emb[0], attn_applied[0]), 1)
+        output = self.attn_combine(output).unsqueeze(0)
+
+        output = F.relu(output)
+        output, hidden = self.gru(output, hidden)
+
+        log_probs = F.log_softmax(self.out(output[0]), dim=1)
+
+        return log_probs, hidden, attn_weights
 
 
 
@@ -449,9 +507,16 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
     epochs = args.epochs
     batch_sz = args.batch_size
     hidden_sz = args.hidden_size
+    decoder_type = args.decoder
 
-    # instantiate model
-    seq2seq = Seq2SeqSemanticParser(input_indexer, output_indexer, input_max_len, hidden_sz, output_max_len)
+    # instantiate model with correct decoder
+    if decoder_type not in ['vanilla', 'attention']:
+        print('Error: decoder type must be either "vanilla" or "attention"')
+        exit(-1)
+
+    seq2seq = Seq2SeqSemanticParser(input_indexer, output_indexer,
+                                    input_max_len, hidden_sz,
+                                    output_max_len, decoder_type=decoder_type)
 
     encoder_optim = torch.optim.Adam(seq2seq.encoder.parameters(), lr=lr)
     decoder_optim = torch.optim.Adam(seq2seq.decoder.parameters(), lr=lr)
@@ -499,14 +564,6 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
         avg_loss /= n_batches
 
         return avg_loss
-
-
-    def _test(seq2seq:Seq2SeqSemanticParser,
-               all_test_input_data:np.ndarray,
-               all_test_output_data:np.ndarray) -> float:
-        """
-        Evaluates the seq2seq model on test data
-        """
 
 
     for e in range(epochs):
