@@ -70,7 +70,7 @@ class NearestNeighborSemanticParser(object):
 class Seq2SeqSemanticParser(nn.Module):
     def __init__(self, input_indexer, output_indexer,
                  in_emb_dim, hidden_size, out_max_len,
-                 embedding_dropout=0.2, tf_ratio=0.5, bidirect=True):
+                 embedding_dropout=0.2, tf_ratio=1.0, bidirect=True):
 
         # We've include some args for setting up the input embedding and encoder
         # You'll need to add code for output embedding and decoder
@@ -84,7 +84,7 @@ class Seq2SeqSemanticParser(nn.Module):
         self.input_emb = EmbeddingLayer(in_emb_dim, len(input_indexer), embedding_dropout)
         self.encoder = RNNEncoder(in_emb_dim, hidden_size, bidirect)
 
-        self.output_emb = EmbeddingLayer(hidden_size, len(output_indexer), 0.5)
+        self.output_emb = EmbeddingLayer(hidden_size, len(output_indexer), embedding_dropout)
         self.decoder = RNNDecoder(hidden_size, len(output_indexer))
 
 
@@ -207,10 +207,6 @@ class Seq2SeqSemanticParser(nn.Module):
         y_step = torch.tensor([[self.output_indexer.index_of(SOS_SYMBOL)] * batch_sz]).reshape(batch_sz, -1)
 
         teacher_forcing = True if random.random() < self.tf_ratio else False
-
-        # update ratio
-        if teacher_forcing:
-            self.tf_ratio -= .05
 
         # teacher forcing, pass gold target as input for current timestep
         for t in range(target_len):
@@ -452,7 +448,7 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
     lr = args.lr
     epochs = args.epochs
     batch_sz = args.batch_size
-    hidden_sz = 300
+    hidden_sz = args.hidden_size
 
     # instantiate model
     seq2seq = Seq2SeqSemanticParser(input_indexer, output_indexer, input_max_len, hidden_sz, output_max_len)
@@ -514,10 +510,7 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
 
 
     for e in range(epochs):
-
         avg_loss = _train(seq2seq, all_train_input_data, all_train_output_data, batch_sz)
-        # metrics = _test(seq2seq, all_test_input_data, all_test_output_data)
-
         print(f"===> Epoch: {e}, Avg. Loss: {avg_loss}")
 
     return seq2seq
