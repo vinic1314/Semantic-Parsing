@@ -70,13 +70,15 @@ class NearestNeighborSemanticParser(object):
 
 class Seq2SeqSemanticParser(nn.Module):
     def __init__(self, input_indexer, output_indexer,
-                 in_emb_dim, hidden_size, out_max_len,
+                 in_emb_dim, hidden_size, out_max_len, batch_sz,
                  embedding_dropout=0.2, tf_ratio=1.0, bidirect=True, decoder_type='vanilla'):
 
         # We've include some args for setting up the input embedding and encoder
         # You'll need to add code for output embedding and decoder
         super(Seq2SeqSemanticParser, self).__init__()
+        self.batch_sz = batch_sz
         self.tf_ratio = tf_ratio
+        self.decoder_type = decoder_type
         self.input_indexer = input_indexer
         self.output_indexer = output_indexer
         self.out_max_len = out_max_len
@@ -88,7 +90,7 @@ class Seq2SeqSemanticParser(nn.Module):
         self.output_emb = EmbeddingLayer(hidden_size, len(output_indexer), embedding_dropout)
 
         if decoder_type == 'attention':
-            self.decoder = AttnDecoder(hidden_size, len(output_indexer))
+            self.decoder = AttnDecoder(hidden_size, len(output_indexer), out_max_len, batch_sz)
         else:
             self.decoder = RNNDecoder(hidden_size, len(output_indexer))
 
@@ -103,9 +105,7 @@ class Seq2SeqSemanticParser(nn.Module):
         """
 
         enc_word, enc_mask, enc_h = self._encode_input(x_tensor, inp_lens_tensor)
-        init_h = enc_h
-
-        avg_loss, loss = self._decode_output(y_tensor, init_h)
+        avg_loss, loss = self._decode_output(y_tensor, enc_h, enc_word)
 
         return avg_loss, loss
 
@@ -192,7 +192,8 @@ class Seq2SeqSemanticParser(nn.Module):
         enc_final_states_reshaped = (enc_final_states[0].unsqueeze(0), enc_final_states[1].unsqueeze(0))
         return (enc_output_each_word, enc_context_mask, enc_final_states_reshaped)
 
-    def _decode_output(self, y_tensor:torch.Tensor, init_h:tuple) -> (torch.Tensor, torch.Tensor):
+    def _decode_output(self, y_tensor:torch.Tensor, init_h:tuple,
+                       enc_outputs:torch.Tensor) -> (torch.Tensor, torch.Tensor):
         """
         passes target through decoder one time step at a time using teacher forcing
         :arg y_tensor: tensor with target indices for decoder
@@ -205,11 +206,10 @@ class Seq2SeqSemanticParser(nn.Module):
         dec_hidden = init_h
 
         loss = 0.0
-        batch_sz = y_tensor.shape[0]
         target_len = y_tensor.shape[1]
 
         # SOS token, initial input
-        y_step = torch.tensor([[self.output_indexer.index_of(SOS_SYMBOL)] * batch_sz]).reshape(batch_sz, -1)
+        y_step = torch.tensor([[self.output_indexer.index_of(SOS_SYMBOL)] * self.batch_sz]).reshape(self.batch_sz, -1)
 
         teacher_forcing = True if random.random() < self.tf_ratio else False
 
@@ -218,24 +218,27 @@ class Seq2SeqSemanticParser(nn.Module):
 
             out_emb = self.output_emb(y_step)
 
-            probs, dec_hidden = self.decoder(out_emb, dec_hidden)
+            if self.decoder_type == 'attention':
+                log_probs, dec_hidden = self.decoder(out_emb, dec_hidden, enc_outputs)
+            else:
+                log_probs, dec_hidden = self.decoder(out_emb, dec_hidden)
 
             target = y_tensor[:, t]
-            loss += F.nll_loss(probs, target, ignore_index=self.pad_idx)
+            loss += F.nll_loss(log_probs, target, ignore_index=self.pad_idx)
 
             if teacher_forcing:
                 # pass target as input
-                y_step = target.reshape(batch_sz, 1)
+                y_step = target.reshape(self.batch_sz, 1)
 
             else:
                 # pass prediction as next input
-                y_step = torch.argmax(probs, dim=1).detach().reshape(batch_sz, -1)
+                y_step = torch.argmax(log_probs, dim=1).detach().reshape(self.batch_sz, -1)
 
         # compute mean loss across timesteps
         loss = loss / target_len
 
         # compute mean loss across the batch
-        avg_loss = loss / batch_sz
+        avg_loss = loss / self.batch_sz
 
         # TODO train on first 5 tokens of each sequence
         # model not using encoder information correctly
@@ -395,16 +398,16 @@ class RNNDecoder(nn.Module):
 
 class AttnDecoder(nn.Module):
 
-    def __init__(self, hidden_sz:int, output_sz:int, max_length:int):
+    def __init__(self, hidden_sz:int, output_sz:int, max_length:int, batch_sz:int):
         super(AttnDecoder, self).__init__()
+        self.batch_sz = batch_sz
         self.hidden_sz = hidden_sz
         self.output_sz = output_sz
         self.max_length = max_length
-        self.attn = nn.Linear(hidden_sz * 2, max_length)
-        self.attn_combine = nn.Linear(hidden_sz * 2, hidden_sz)
+        self.alignment = nn.Linear(2*hidden_sz, hidden_sz)
         self.dropout = nn.Dropout(p=0.2)
-        self.rnn = nn.LSTM(hidden_sz, hidden_sz)
-        self.out = nn.Linear(hidden_sz, output_sz)
+        self.rnn = nn.LSTM(hidden_sz, hidden_sz, batch_first=True)
+        self.out = nn.Linear(2*hidden_sz, output_sz)
 
         self.init_weight()
 
@@ -412,9 +415,10 @@ class AttnDecoder(nn.Module):
         """
         Initializes weight matrices using Xavier initialization
         """
-        nn.init.xavier_uniform_(self.attn.weight)
-        nn.init.xavier_uniform_(self.attn_combine.weight)
+        # nn.init.xavier_uniform_(self.attn.weight)
+        # nn.init.xavier_uniform_(self.attn_combine.weight)
         nn.init.xavier_uniform_(self.out.weight)
+        nn.init.xavier_uniform_(self.alignment.weight)
         nn.init.xavier_uniform_(self.rnn.weight_hh_l0, gain=1)
         nn.init.xavier_uniform_(self.rnn.weight_ih_l0, gain=1)
 
@@ -423,25 +427,37 @@ class AttnDecoder(nn.Module):
 
     def forward(self, emb, hidden, enc_outputs):
         """
-        :arg emb: embeddings for target language
-        :arg hidden: hidden state of encoder, initial state of decoder
-        :arg enc_outputs: outputs for each token in source language, used for attention
+        Attention is computed after the LSTM cell
+
+        :arg emb: embeddings for target language (batch_sz x seq_len x hidden_sz)
+        :arg hidden: hidden state of encoder, initial state of decoder (h_t, c_t seq_len x batch_sz x hidden_sz)
+        :arg enc_outputs: outputs for each token in source language (max_seq_len x batch_sz x 2*hidden_sz)
         :returns: log probability distribution over target language,
-                  hidden state of current cell, and attention weights
+                  hidden state of current cell
         """
 
-        attn_weights = F.softmax(self.attn(torch.cat((emb[0], hidden[0]), 1)), dim=1)
-        attn_applied = torch.bmm(attn_weights.unsqueeze(0), enc_outputs.unsqueeze(0))
+        x = F.relu(emb)
+        output, _ = self.rnn(x, hidden)
 
-        output = torch.cat((emb[0], attn_applied[0]), 1)
-        output = self.attn_combine(output).unsqueeze(0)
+        enc_outputs = enc_outputs.reshape((self.batch_sz, -1, self.hidden_sz * 2))
 
-        output = F.relu(output)
-        output, hidden = self.gru(output, hidden)
+        # align encoder outputs with current hidden state
+        align = self.alignment(enc_outputs)
 
-        log_probs = F.log_softmax(self.out(output[0]), dim=1)
+        # compute attention weights
+        attn_w = output.bmm(align.permute((0,2,1)))
 
-        return log_probs, hidden, attn_weights
+        char_distr = F.softmax(attn_w, dim=2)
+
+        # context vector for current state
+        c_i = char_distr.bmm(align)
+
+        h_distr = torch.cat([c_i, output], dim=2)
+
+        x = self.out(h_distr).reshape((self.batch_sz, self.output_sz))
+        log_probs = F.log_softmax(x, dim=1)
+
+        return log_probs, hidden
 
 
 
@@ -516,7 +532,8 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
 
     seq2seq = Seq2SeqSemanticParser(input_indexer, output_indexer,
                                     input_max_len, hidden_sz,
-                                    output_max_len, decoder_type=decoder_type)
+                                    output_max_len, batch_sz,
+                                    decoder_type=decoder_type)
 
     encoder_optim = torch.optim.Adam(seq2seq.encoder.parameters(), lr=lr)
     decoder_optim = torch.optim.Adam(seq2seq.decoder.parameters(), lr=lr)
