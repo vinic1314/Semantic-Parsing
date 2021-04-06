@@ -112,6 +112,7 @@ class Seq2SeqSemanticParser(nn.Module):
 
     def decode(self, test_data: List[Example]) -> List[List[Derivation]]:
 
+        # TODO implement Beam Search
 
         EOS = self.output_indexer.index_of(EOS_SYMBOL)
 
@@ -139,10 +140,10 @@ class Seq2SeqSemanticParser(nn.Module):
                 out_emb = self.output_emb(y_step)
 
                 # call decoder and get most likely token at each step
-                probs, dec_h = self.decoder(out_emb, dec_h)
+                log_probs, dec_h = self.decoder(out_emb, dec_h, enc_word)
 
                 # new input is predicted token
-                y_step_t = torch.argmax(probs, dim=1).detach()
+                y_step_t = torch.argmax(log_probs, dim=1).detach()
 
                 if y_step_t.item() == EOS:
                     break
@@ -153,6 +154,7 @@ class Seq2SeqSemanticParser(nn.Module):
 
                 y_step = y_step_t.reshape(1, -1)
 
+            # TODO compute probability
             deriv = Derivation(test_data[i], 1, deriv)
             derivations.append([deriv])
 
@@ -407,7 +409,7 @@ class AttnDecoder(nn.Module):
         self.alignment = nn.Linear(2*hidden_sz, hidden_sz)
         self.dropout = nn.Dropout(p=0.2)
         self.rnn = nn.LSTM(hidden_sz, hidden_sz, batch_first=True)
-        self.out = nn.Linear(2*hidden_sz, output_sz)
+        self.W = nn.Linear(3*hidden_sz, output_sz)
 
         self.init_weight()
 
@@ -417,7 +419,7 @@ class AttnDecoder(nn.Module):
         """
         # nn.init.xavier_uniform_(self.attn.weight)
         # nn.init.xavier_uniform_(self.attn_combine.weight)
-        nn.init.xavier_uniform_(self.out.weight)
+        nn.init.xavier_uniform_(self.W.weight)
         nn.init.xavier_uniform_(self.alignment.weight)
         nn.init.xavier_uniform_(self.rnn.weight_hh_l0, gain=1)
         nn.init.xavier_uniform_(self.rnn.weight_ih_l0, gain=1)
@@ -438,23 +440,22 @@ class AttnDecoder(nn.Module):
 
         x = F.relu(emb)
         output, _ = self.rnn(x, hidden)
-
-        enc_outputs = enc_outputs.reshape((self.batch_sz, -1, self.hidden_sz * 2))
+        enc_outputs = enc_outputs.permute((1,0,2))
 
         # align encoder outputs with current hidden state
         align = self.alignment(enc_outputs)
 
-        # compute attention weights
-        attn_w = output.bmm(align.permute((0,2,1)))
+        e = output.bmm(align.permute((0,2,1)))
 
-        char_distr = F.softmax(attn_w, dim=2)
+        # compute attention weights
+        attn_w = F.softmax(e, dim=2)
 
         # context vector for current state
-        c_i = char_distr.bmm(align)
+        c = attn_w.bmm(enc_outputs)
 
-        h_distr = torch.cat([c_i, output], dim=2)
+        h_tau = torch.cat([c, output], dim=2)
 
-        x = self.out(h_distr).reshape((self.batch_sz, self.output_sz))
+        x = self.W(h_tau).reshape((-1, self.output_sz))
         log_probs = F.log_softmax(x, dim=1)
 
         return log_probs, hidden
