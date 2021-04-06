@@ -394,7 +394,6 @@ class RNNDecoder(nn.Module):
         output, (h, c) = self.rnn(input, hidden)
         x = self.out(output).reshape(-1, self.output_sz)
         probs = self.softmax(x)
-        s = probs.sum(dim=1)
         return probs, (h, c)
 
 
@@ -439,26 +438,28 @@ class AttnDecoder(nn.Module):
         """
 
         x = F.relu(emb)
-        output, _ = self.rnn(x, hidden)
+        output, (h, c) = self.rnn(x, hidden)
         enc_outputs = enc_outputs.permute((1,0,2))
 
         # align encoder outputs with current hidden state
         align = self.alignment(enc_outputs)
 
+        # compute energies
         e = output.bmm(align.permute((0,2,1)))
 
         # compute attention weights
         attn_w = F.softmax(e, dim=2)
 
         # context vector for current state
-        c = attn_w.bmm(enc_outputs)
+        c_i = attn_w.bmm(enc_outputs)
 
-        h_tau = torch.cat([c, output], dim=2)
+        # attention hidden state
+        attn_h = torch.cat([c_i, output], dim=2)
 
-        x = self.W(h_tau).reshape((-1, self.output_sz))
+        x = self.W(attn_h).reshape((-1, self.output_sz))
         log_probs = F.log_softmax(x, dim=1)
 
-        return log_probs, hidden
+        return log_probs, (h, c)
 
 
 
