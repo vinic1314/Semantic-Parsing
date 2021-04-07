@@ -139,8 +139,11 @@ class Seq2SeqSemanticParser(nn.Module):
                 # embed target token
                 out_emb = self.output_emb(y_step)
 
-                # call decoder and get most likely token at each step
-                log_probs, dec_h = self.decoder(out_emb, dec_h, enc_word)
+                if self.decoder_type != 'vanilla':
+                    # call decoder and get most likely token at each step
+                    log_probs, dec_h = self.decoder(out_emb, dec_h, enc_word)
+                else:
+                    log_probs, dec_h = self.decoder(out_emb, dec_h)
 
                 # new input is predicted token
                 y_step_t = torch.argmax(log_probs, dim=1).detach()
@@ -494,7 +497,8 @@ def make_padded_output_tensor(exs, output_indexer, max_len):
     return np.array([[ex.y_indexed[i] if i < len(ex.y_indexed) else output_indexer.index_of(PAD_SYMBOL) for i in range(0, max_len)] for ex in exs])
 
 
-def train_model_encdec(train_data: List[Example], dev_data: List[Example], input_indexer, output_indexer, args) -> Seq2SeqSemanticParser:
+def train_model_encdec(train_data: List[Example], dev_data: List[Example],
+                       input_indexer, output_indexer, args) -> Seq2SeqSemanticParser:
     """
     Function to train the encoder-decoder model on the given data.
     :param train_data:
@@ -526,6 +530,7 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
     batch_sz = args.batch_size
     hidden_sz = args.hidden_size
     decoder_type = args.decoder
+    writer = SummaryWriter()
 
     # instantiate model with correct decoder
     if decoder_type not in ['vanilla', 'attention']:
@@ -588,5 +593,9 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
     for e in range(epochs):
         avg_loss = _train(seq2seq, all_train_input_data, all_train_output_data, batch_sz)
         print(f"===> Epoch: {e}, Avg. Loss: {avg_loss}")
+        writer.add_scalar('Training Loss: Vanilla decoder', avg_loss, e)
+
+    writer.flush()
+    writer.close()
 
     return seq2seq
