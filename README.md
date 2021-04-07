@@ -1,14 +1,15 @@
 
 # Geoquery parsing 
 This is a project for CS 388 Natural Language Processing, spring 2021 semester.
-In this project, I created a semantic parser from scratch using an Sequence2Sequence model
-built in PyTorch. The evaluation code was provided and was developed by Robert Jia and Percy Liang
+In this project, I created a semantic parser using an Sequence2Sequence model
+built in PyTorch to perform semantic parsing on a geoquery dataset. The LSTM based encoder was provided by the course. The evaluation code was developed by Robert Jia and Percy Liang
 of Stanford.
 
 
 ## Goal
  Create a decoder module in PyTorch, combine it with the encoder, perform training, and perform
-inference. This was to perform semantic parsing on a geoquery dataset.
+inference. I had to implement two different Decoder modules: a basic LSTM based decoder, and an LSTM decoder with an
+additional attention layer.
 
 Two examples from the dataset are provided below:
 
